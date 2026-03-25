@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -56,14 +58,22 @@ func NewHTTPServer(options *Options) (*HTTPServer, error) {
 
 	// If a static directory is specified, also serve it.
 	if options.HTTPDirectory != "" {
-		abs, _ := filepath.Abs(options.HTTPDirectory)
+		abs, err := filepath.Abs(options.HTTPDirectory)
+		if err != nil {
+			gologger.Warning().Msgf("Could not resolve HTTP directory path: %s", err)
+			abs = options.HTTPDirectory
+		}
 		gologger.Info().Msgf("Loading directory (%s) to serve from : %s/s/", abs, strings.Join(options.Domains, ","))
 		server.staticHandler = http.StripPrefix("/s/", disableDirectoryListing(http.FileServer(http.Dir(options.HTTPDirectory))))
 	}
 	// If custom index, read the custom index file and serve it.
 	// Supports {DOMAIN} placeholders.
 	if options.HTTPIndex != "" {
-		abs, _ := filepath.Abs(options.HTTPIndex)
+		abs, err := filepath.Abs(options.HTTPIndex)
+		if err != nil {
+			gologger.Warning().Msgf("Could not resolve HTTP index path: %s", err)
+			abs = options.HTTPIndex
+		}
 		gologger.Info().Msgf("Using custom server index: %s", abs)
 		if data, err := os.ReadFile(options.HTTPIndex); err == nil {
 			server.customBanner = string(data)
@@ -73,7 +83,11 @@ func NewHTTPServer(options *Options) (*HTTPServer, error) {
 	// This takes priority over all other response options.
 	// Supports {DOMAIN} placeholders.
 	if options.DefaultHTTPResponseFile != "" {
-		abs, _ := filepath.Abs(options.DefaultHTTPResponseFile)
+		abs, err := filepath.Abs(options.DefaultHTTPResponseFile)
+		if err != nil {
+			gologger.Warning().Msgf("Could not resolve default HTTP response file path: %s", err)
+			abs = options.DefaultHTTPResponseFile
+		}
 		gologger.Info().Msgf("Using default HTTP response file for all requests: %s", abs)
 		if data, err := os.ReadFile(options.DefaultHTTPResponseFile); err == nil {
 			server.defaultResponse = string(data)
@@ -112,6 +126,18 @@ func (h *HTTPServer) ListenAndServe(tlsConfig *tls.Config, httpAlive, httpsAlive
 		httpAlive <- false
 		gologger.Error().Msgf("Could not serve http: %s\n", err)
 	}
+}
+
+// Close gracefully shuts down both the TLS and non-TLS HTTP servers, waiting
+// up to the given timeout for active connections to finish before forcibly
+// closing them.
+func (h *HTTPServer) Close(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return errors.Join(
+		h.nontlsserver.Shutdown(ctx),
+		h.tlsserver.Shutdown(ctx),
+	)
 }
 
 func (h *HTTPServer) logger(handler http.Handler) http.HandlerFunc {

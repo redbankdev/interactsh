@@ -427,8 +427,8 @@ func (c *Client) getInteractions(callback InteractionCallback) error {
 	resp, err := c.httpClient.Do(req)
 	defer func() {
 		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
 			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 		}
 	}()
 	if err != nil {
@@ -573,15 +573,18 @@ func (c *Client) Close() error {
 	resp, err := c.httpClient.Do(req)
 	defer func() {
 		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
 			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 		}
 	}()
 	if err != nil {
 		return errkit.Wrap(err, "could not make deregister request")
 	}
 	if resp.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(resp.Body)
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return errkit.Wrap(err, "could not read deregister response")
+		}
 		return fmt.Errorf("could not deregister to server: %s", string(data))
 	}
 
@@ -610,8 +613,8 @@ func (c *Client) performRegistration(serverURL string, payload []byte) error {
 	resp, err := c.httpClient.Do(req)
 	defer func() {
 		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
 			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 		}
 	}()
 	if err != nil {
@@ -621,7 +624,10 @@ func (c *Client) performRegistration(serverURL string, payload []byte) error {
 		return errors.New("invalid token provided for interactsh server")
 	}
 	if resp.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(resp.Body)
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return errkit.Wrap(err, "could not read register response")
+		}
 		return fmt.Errorf("could not register to server: %s", string(data))
 	}
 	response := make(map[string]interface{})
@@ -632,8 +638,12 @@ func (c *Client) performRegistration(serverURL string, payload []byte) error {
 	if !ok {
 		return errors.New("could not get register response")
 	}
-	if message.(string) != "registration successful" {
-		return fmt.Errorf("could not get register response: %s", message.(string))
+	msgStr, ok := message.(string)
+	if !ok {
+		return errors.New("could not get register response: unexpected message type")
+	}
+	if msgStr != "registration successful" {
+		return fmt.Errorf("could not get register response: %s", msgStr)
 	}
 
 	c.State.Store(Idle)
