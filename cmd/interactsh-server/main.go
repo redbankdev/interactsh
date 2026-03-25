@@ -371,6 +371,7 @@ func main() {
 			gologger.Fatal().Msgf("Could not create FTP server: %s", err)
 		}
 		go ftpServer.ListenAndServe(tlsConfig, ftpAlive, ftpsAlive) //nolint
+		defer ftpServer.Close()
 	}
 
 	responderAlive := make(chan bool)
@@ -394,6 +395,7 @@ func main() {
 	}
 
 	gologger.Info().Msgf("Listening with the following services:\n")
+	stopStatusMonitor := make(chan struct{})
 	go func() {
 		for {
 			service := ""
@@ -402,6 +404,8 @@ func main() {
 			status := true
 			fatal := false
 			select {
+			case <-stopStatusMonitor:
+				return
 			case status = <-dnsUdpAlive:
 				service = "DNS"
 				network = "UDP"
@@ -474,17 +478,32 @@ func main() {
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
-	for range c {
-		if err := store.Close(); err != nil {
-			gologger.Warning().Msgf("Couldn't close the storage: %s\n", err)
-		}
-		if pprofServer != nil {
-			if err := pprofServer.Close(); err != nil {
-				gologger.Warning().Msgf("Couldn't close the pprof server: %s\n", err)
-			}
-		}
-		os.Exit(1)
+	<-c
+
+	// Stop the service-status monitor goroutine.
+	close(stopStatusMonitor)
+
+	// Use a shared 10-second timeout budget for graceful server shutdown.
+	const shutdownTimeout = 10 * time.Second
+
+	if err := store.Close(); err != nil {
+		gologger.Warning().Msgf("Couldn't close the storage: %s\n", err)
 	}
+	if err := httpServer.Close(shutdownTimeout); err != nil {
+		gologger.Warning().Msgf("Couldn't close the HTTP server: %s\n", err)
+	}
+	if err := dnsTcpServer.Close(shutdownTimeout); err != nil {
+		gologger.Warning().Msgf("Couldn't close the TCP DNS server: %s\n", err)
+	}
+	if err := dnsUdpServer.Close(shutdownTimeout); err != nil {
+		gologger.Warning().Msgf("Couldn't close the UDP DNS server: %s\n", err)
+	}
+	if pprofServer != nil {
+		if err := pprofServer.Close(); err != nil {
+			gologger.Warning().Msgf("Couldn't close the pprof server: %s\n", err)
+		}
+	}
+	os.Exit(0)
 }
 
 func getPublicIP() (string, error) {

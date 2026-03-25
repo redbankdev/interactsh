@@ -18,6 +18,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// dnsDefaultTTL is the default TTL in seconds for DNS responses (1 hour).
+const dnsDefaultTTL = 3600
+
 // DNSServer is a DNS server instance that listens on port 53.
 type DNSServer struct {
 	options       *Options
@@ -51,7 +54,7 @@ func NewDNSServer(network string, options *Options) *DNSServer {
 		ipAddresses:   options.IPAddresses,
 		mxDomains:     mxDomains,
 		nsDomains:     nsDomains,
-		timeToLive:    3600,
+		timeToLive:    dnsDefaultTTL,
 		customRecords: newCustomDNSRecordsServer(options.CustomRecords, options.Domains),
 	}
 	server.server = &dns.Server{
@@ -69,6 +72,16 @@ func (h *DNSServer) ListenAndServe(dnsAlive chan bool) {
 		gologger.Error().Msgf("Could not listen for %s DNS on %s (%s)\n", strings.ToUpper(h.server.Net), h.server.Addr, err)
 		dnsAlive <- false
 	}
+}
+
+// Close gracefully shuts down the DNS server, waiting up to the given timeout
+// for in-flight queries to finish. It delegates to ShutdownContext from the
+// underlying dns.Server, which differs from a hard close by draining active
+// connections rather than dropping them.
+func (h *DNSServer) Close(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return h.server.ShutdownContext(ctx)
 }
 
 // ServeDNS is the default handler for DNS queries.

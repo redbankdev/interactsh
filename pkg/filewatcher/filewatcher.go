@@ -49,6 +49,9 @@ func (f *FileWatcher) Watch() (chan string, error) {
 				}
 
 			}
+			if err := sc.Err(); err != nil {
+				gologger.Warning().Msgf("Error reading file %s: %s", f.Options.File, err)
+			}
 			_ = r.Close()
 		}
 	}()
