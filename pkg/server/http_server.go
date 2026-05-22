@@ -173,8 +173,11 @@ func (h *HTTPServer) Close(timeout time.Duration) error {
 
 func (h *HTTPServer) logger(handler http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		req, _ := httputil.DumpRequest(r, true)
+		req, err := httputil.DumpRequest(r, shouldDumpBody(r))
 		reqString := string(req)
+		if err != nil {
+			gologger.Warning().Msgf("Could not dump http request: %s", err)
+		}
 
 		gologger.Debug().Msgf("New HTTP request: \n\n%s\n", reqString)
 		rec := httptest.NewRecorder()
@@ -253,6 +256,16 @@ func (h *HTTPServer) logger(handler http.Handler) http.HandlerFunc {
 			}
 		}
 	}
+}
+
+func shouldDumpBody(r *http.Request) bool {
+	if r.Body == nil {
+		return false
+	}
+	if r.ContentLength < 0 {
+		return false
+	}
+	return r.ContentLength <= maxRequestBodyBytes
 }
 
 func httpProtocol(r *http.Request) string {
@@ -500,6 +513,10 @@ type RegisterRequest struct {
 
 // registerHandler is a handler for client register requests
 func (h *HTTPServer) registerHandler(w http.ResponseWriter, req *http.Request) {
+	if !ensureMethod(w, req, http.MethodPost) {
+		return
+	}
+
 	r := &RegisterRequest{}
 	if err := decodeJSONBody(w, req, r); err != nil {
 		if isRequestBodyTooLarge(err) {
@@ -532,6 +549,10 @@ type DeregisterRequest struct {
 
 // deregisterHandler is a handler for client deregister requests
 func (h *HTTPServer) deregisterHandler(w http.ResponseWriter, req *http.Request) {
+	if !ensureMethod(w, req, http.MethodPost) {
+		return
+	}
+
 	atomic.AddInt64(&h.options.Stats.Sessions, -1)
 
 	r := &DeregisterRequest{}
@@ -572,6 +593,10 @@ type PollResponse struct {
 
 // pollHandler is a handler for client poll requests
 func (h *HTTPServer) pollHandler(w http.ResponseWriter, req *http.Request) {
+	if !ensureMethod(w, req, http.MethodGet, http.MethodHead) {
+		return
+	}
+
 	ID := req.URL.Query().Get("id")
 	if ID == "" {
 		jsonError(w, "no id specified for poll", http.StatusBadRequest)
@@ -645,6 +670,17 @@ func jsonMsg(w http.ResponseWriter, err string, code int) {
 	jsonBody(w, "message", err, code)
 }
 
+func ensureMethod(w http.ResponseWriter, req *http.Request, methods ...string) bool {
+	for _, method := range methods {
+		if req.Method == method {
+			return true
+		}
+	}
+	w.Header().Set("Allow", strings.Join(methods, ", "))
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	return false
+}
+
 func decodeJSONBody(w http.ResponseWriter, req *http.Request, target interface{}) error {
 	req.Body = http.MaxBytesReader(w, req.Body, maxRequestBodyBytes)
 	decoder := jsoniter.NewDecoder(req.Body)
@@ -679,6 +715,10 @@ func (h *HTTPServer) checkToken(req *http.Request) bool {
 
 // metricsHandler is a handler for /metrics endpoint
 func (h *HTTPServer) metricsHandler(w http.ResponseWriter, req *http.Request) {
+	if !ensureMethod(w, req, http.MethodGet, http.MethodHead) {
+		return
+	}
+
 	interactMetrics := h.options.Stats
 	interactMetrics.Cache = GetCacheMetrics(h.options)
 	interactMetrics.Cpu = GetCpuMetrics()
