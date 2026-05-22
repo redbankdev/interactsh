@@ -51,15 +51,24 @@ func TestWriteResponseFromDynamicRequest(t *testing.T) {
 		require.Equal(t, "this is example body", string(body), "could not get correct result")
 	})
 
-        t.Run("b64_body", func(t *testing.T) {
-                req := httptest.NewRequest("GET", "http://example.com/?b64_body=dGhpcyBpcyBleGFtcGxlIGJvZHk=", nil)
-                w := httptest.NewRecorder()
-                writeResponseFromDynamicRequest(w, req)
+	t.Run("b64_body", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/?b64_body=dGhpcyBpcyBleGFtcGxlIGJvZHk=", nil)
+		w := httptest.NewRecorder()
+		writeResponseFromDynamicRequest(w, req)
 
-                resp := w.Result()
-                body, _ := io.ReadAll(resp.Body)
-                require.Equal(t, "this is example body", string(body), "could not get correct result")
-        })
+		resp := w.Result()
+		body, _ := io.ReadAll(resp.Body)
+		require.Equal(t, "this is example body", string(body), "could not get correct result")
+	})
+	t.Run("b64_body_path", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "http://example.com/b64_body:dGhpcyBpcyBleGFtcGxlIGJvZHk=/", nil)
+		w := httptest.NewRecorder()
+		writeResponseFromDynamicRequest(w, req)
+
+		resp := w.Result()
+		body, _ := io.ReadAll(resp.Body)
+		require.Equal(t, "this is example body", string(body), "could not get correct result")
+	})
 	t.Run("header", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "http://example.com/?header=Key:value&header=Test:Another", nil)
 		w := httptest.NewRecorder()

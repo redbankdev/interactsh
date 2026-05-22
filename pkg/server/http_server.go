@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -21,6 +22,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/projectdiscovery/gologger"
 	stringsutil "github.com/projectdiscovery/utils/strings"
+	"golang.org/x/net/http/httpguts"
 )
 
 // HTTPServer is a http server instance that listens both
@@ -33,6 +35,17 @@ type HTTPServer struct {
 	defaultResponse string
 	staticHandler   http.Handler
 }
+
+const (
+	b64BodyPrefix       = "/b64_body:"
+	maxRequestBodyBytes = 1 << 20
+	maxHeaderBytes      = 1 << 20
+	readTimeout         = 30 * time.Second
+	readHeaderTimeout   = 10 * time.Second
+	writeTimeout        = 30 * time.Second
+	idleTimeout         = 60 * time.Second
+	maxDynamicDelay     = 30 * time.Second
+)
 
 type noopLogger struct {
 }
@@ -101,8 +114,26 @@ func NewHTTPServer(options *Options) (*HTTPServer, error) {
 	if server.options.EnableMetrics {
 		router.Handle("/metrics", server.corsMiddleware(server.authMiddleware(http.HandlerFunc(server.metricsHandler))))
 	}
-	server.tlsserver = http.Server{Addr: formatAddress(options.ListenIP, options.HttpsPort), Handler: router, ErrorLog: log.New(&noopLogger{}, "", 0)}
-	server.nontlsserver = http.Server{Addr: formatAddress(options.ListenIP, options.HttpPort), Handler: router, ErrorLog: log.New(&noopLogger{}, "", 0)}
+	server.tlsserver = http.Server{
+		Addr:              formatAddress(options.ListenIP, options.HttpsPort),
+		Handler:           router,
+		ErrorLog:          log.New(&noopLogger{}, "", 0),
+		ReadTimeout:       readTimeout,
+		ReadHeaderTimeout: readHeaderTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
+	server.nontlsserver = http.Server{
+		Addr:              formatAddress(options.ListenIP, options.HttpPort),
+		Handler:           router,
+		ErrorLog:          log.New(&noopLogger{}, "", 0),
+		ReadTimeout:       readTimeout,
+		ReadHeaderTimeout: readHeaderTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
 	return server, nil
 }
 
@@ -142,8 +173,11 @@ func (h *HTTPServer) Close(timeout time.Duration) error {
 
 func (h *HTTPServer) logger(handler http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		req, _ := httputil.DumpRequest(r, true)
+		req, err := httputil.DumpRequest(r, shouldDumpBody(r))
 		reqString := string(req)
+		if err != nil {
+			gologger.Warning().Msgf("Could not dump http request: %s", err)
+		}
 
 		gologger.Debug().Msgf("New HTTP request: \n\n%s\n", reqString)
 		rec := httptest.NewRecorder()
@@ -222,6 +256,16 @@ func (h *HTTPServer) logger(handler http.Handler) http.HandlerFunc {
 			}
 		}
 	}
+}
+
+func shouldDumpBody(r *http.Request) bool {
+	if r.Body == nil {
+		return false
+	}
+	if r.ContentLength < 0 {
+		return false
+	}
+	return r.ContentLength <= maxRequestBodyBytes
 }
 
 func httpProtocol(r *http.Request) string {
@@ -308,22 +352,13 @@ func (h *HTTPServer) defaultHandler(w http.ResponseWriter, req *http.Request) {
 	if stringsutil.HasPrefixI(req.URL.Path, "/s/") && h.staticHandler != nil {
 		if h.options.DynamicResp && len(req.URL.Query()) > 0 {
 			values := req.URL.Query()
-			if headers := values["header"]; len(headers) > 0 {
-				for _, header := range headers {
-					if headerParts := strings.SplitN(header, ":", 2); len(headerParts) == 2 {
-						w.Header().Add(headerParts[0], headerParts[1])
-					}
-				}
+			applyDynamicHeaders(w, values["header"])
+			ensureDynamicDefaults(w)
+			if delay, ok := parseDynamicDelay(values.Get("delay")); ok {
+				time.Sleep(delay)
 			}
-			if delay := values.Get("delay"); delay != "" {
-				if parsed, err := strconv.Atoi(delay); err == nil {
-					time.Sleep(time.Duration(parsed) * time.Second)
-				}
-			}
-			if status := values.Get("status"); status != "" {
-				if parsed, err := strconv.Atoi(status); err == nil {
-					w.WriteHeader(parsed)
-				}
+			if status, ok := parseDynamicStatus(values.Get("status")); ok {
+				w.WriteHeader(status)
 			}
 		}
 		h.staticHandler.ServeHTTP(w, req)
@@ -362,37 +397,108 @@ func (h *HTTPServer) defaultHandler(w http.ResponseWriter, req *http.Request) {
 func writeResponseFromDynamicRequest(w http.ResponseWriter, req *http.Request) {
 	values := req.URL.Query()
 
-	if stringsutil.HasPrefixI(req.URL.Path, "/b64_body:") {
-		firstindex := strings.Index(req.URL.Path, "/b64_body:")
-		lastIndex := strings.LastIndex(req.URL.Path, "/")
-
-		decodedBytes, _ := base64.StdEncoding.DecodeString(req.URL.Path[firstindex+10 : lastIndex])
-		_, _ = w.Write(decodedBytes)
-
-	}
-	if headers := values["header"]; len(headers) > 0 {
-		for _, header := range headers {
-			if headerParts := strings.SplitN(header, ":", 2); len(headerParts) == 2 {
-				w.Header().Add(headerParts[0], headerParts[1])
-			}
+	var pathBody []byte
+	if encoded := extractB64BodyFromPath(req.URL.Path); encoded != "" {
+		if decodedBytes, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+			pathBody = decodedBytes
 		}
 	}
-	if delay := values.Get("delay"); delay != "" {
-		parsed, _ := strconv.Atoi(delay)
-		time.Sleep(time.Duration(parsed) * time.Second)
+	applyDynamicHeaders(w, values["header"])
+	ensureDynamicDefaults(w)
+	if delay, ok := parseDynamicDelay(values.Get("delay")); ok {
+		time.Sleep(delay)
 	}
-	if status := values.Get("status"); status != "" {
-		parsed, _ := strconv.Atoi(status)
-		w.WriteHeader(parsed)
+	if status, ok := parseDynamicStatus(values.Get("status")); ok {
+		w.WriteHeader(status)
+	}
+	if len(pathBody) > 0 {
+		_, _ = w.Write(pathBody)
 	}
 	if body := values.Get("body"); body != "" {
 		_, _ = w.Write([]byte(body))
 	}
-
-	if b64_body := values.Get("b64_body"); b64_body != "" {
-		decodedBytes, _ := base64.StdEncoding.DecodeString(string([]byte(b64_body)))
-		_, _ = w.Write(decodedBytes)
+	if b64Body := values.Get("b64_body"); b64Body != "" {
+		if decodedBytes, err := base64.StdEncoding.DecodeString(b64Body); err == nil {
+			_, _ = w.Write(decodedBytes)
+		}
 	}
+}
+
+func extractB64BodyFromPath(path string) string {
+	if !stringsutil.HasPrefixI(path, b64BodyPrefix) {
+		return ""
+	}
+	start := len(b64BodyPrefix)
+	if start >= len(path) {
+		return ""
+	}
+	end := strings.Index(path[start:], "/")
+	if end == -1 {
+		end = len(path)
+	} else {
+		end += start
+	}
+	if start >= end {
+		return ""
+	}
+	return path[start:end]
+}
+
+func applyDynamicHeaders(w http.ResponseWriter, headers []string) {
+	for _, header := range headers {
+		name, value, ok := parseDynamicHeader(header)
+		if !ok {
+			continue
+		}
+		w.Header().Add(name, value)
+	}
+}
+
+func ensureDynamicDefaults(w http.ResponseWriter) {
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	}
+	if w.Header().Get("X-Content-Type-Options") == "" {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+	}
+}
+
+func parseDynamicHeader(header string) (string, string, bool) {
+	headerParts := strings.SplitN(header, ":", 2)
+	if len(headerParts) != 2 {
+		return "", "", false
+	}
+	name := strings.TrimSpace(headerParts[0])
+	value := strings.TrimSpace(headerParts[1])
+	if !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
+		return "", "", false
+	}
+	return name, value, true
+}
+
+func parseDynamicDelay(delay string) (time.Duration, bool) {
+	if delay == "" {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(delay)
+	if err != nil || parsed <= 0 {
+		return 0, false
+	}
+	if parsed > int(maxDynamicDelay.Seconds()) {
+		parsed = int(maxDynamicDelay.Seconds())
+	}
+	return time.Duration(parsed) * time.Second, true
+}
+
+func parseDynamicStatus(status string) (int, bool) {
+	if status == "" {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(status)
+	if err != nil || parsed < 100 || parsed > 599 {
+		return 0, false
+	}
+	return parsed, true
 }
 
 // RegisterRequest is a request for client registration to interactsh server.
@@ -407,8 +513,16 @@ type RegisterRequest struct {
 
 // registerHandler is a handler for client register requests
 func (h *HTTPServer) registerHandler(w http.ResponseWriter, req *http.Request) {
+	if !ensureMethod(w, req, http.MethodPost) {
+		return
+	}
+
 	r := &RegisterRequest{}
-	if err := jsoniter.NewDecoder(req.Body).Decode(r); err != nil {
+	if err := decodeJSONBody(w, req, r); err != nil {
+		if isRequestBodyTooLarge(err) {
+			jsonError(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		gologger.Warning().Msgf("Could not decode json body: %s\n", err)
 		jsonError(w, fmt.Sprintf("could not decode json body: %s", err), http.StatusBadRequest)
 		return
@@ -435,10 +549,18 @@ type DeregisterRequest struct {
 
 // deregisterHandler is a handler for client deregister requests
 func (h *HTTPServer) deregisterHandler(w http.ResponseWriter, req *http.Request) {
+	if !ensureMethod(w, req, http.MethodPost) {
+		return
+	}
+
 	atomic.AddInt64(&h.options.Stats.Sessions, -1)
 
 	r := &DeregisterRequest{}
-	if err := jsoniter.NewDecoder(req.Body).Decode(r); err != nil {
+	if err := decodeJSONBody(w, req, r); err != nil {
+		if isRequestBodyTooLarge(err) {
+			jsonError(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		gologger.Warning().Msgf("Could not decode json body: %s\n", err)
 		jsonError(w, fmt.Sprintf("could not decode json body: %s", err), http.StatusBadRequest)
 		return
@@ -471,6 +593,10 @@ type PollResponse struct {
 
 // pollHandler is a handler for client poll requests
 func (h *HTTPServer) pollHandler(w http.ResponseWriter, req *http.Request) {
+	if !ensureMethod(w, req, http.MethodGet, http.MethodHead) {
+		return
+	}
+
 	ID := req.URL.Query().Get("id")
 	if ID == "" {
 		jsonError(w, "no id specified for poll", http.StatusBadRequest)
@@ -544,6 +670,28 @@ func jsonMsg(w http.ResponseWriter, err string, code int) {
 	jsonBody(w, "message", err, code)
 }
 
+func ensureMethod(w http.ResponseWriter, req *http.Request, methods ...string) bool {
+	for _, method := range methods {
+		if req.Method == method {
+			return true
+		}
+	}
+	w.Header().Set("Allow", strings.Join(methods, ", "))
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	return false
+}
+
+func decodeJSONBody(w http.ResponseWriter, req *http.Request, target interface{}) error {
+	req.Body = http.MaxBytesReader(w, req.Body, maxRequestBodyBytes)
+	decoder := jsoniter.NewDecoder(req.Body)
+	return decoder.Decode(target)
+}
+
+func isRequestBodyTooLarge(err error) bool {
+	var maxBytesErr *http.MaxBytesError
+	return errors.As(err, &maxBytesErr)
+}
+
 func (h *HTTPServer) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if !h.checkToken(req) {
@@ -555,11 +703,22 @@ func (h *HTTPServer) authMiddleware(next http.Handler) http.Handler {
 }
 
 func (h *HTTPServer) checkToken(req *http.Request) bool {
-	return !h.options.Auth || h.options.Auth && h.options.Token == req.Header.Get("Authorization")
+	if !h.options.Auth {
+		return true
+	}
+	provided := req.Header.Get("Authorization")
+	if provided == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(h.options.Token), []byte(provided)) == 1
 }
 
 // metricsHandler is a handler for /metrics endpoint
 func (h *HTTPServer) metricsHandler(w http.ResponseWriter, req *http.Request) {
+	if !ensureMethod(w, req, http.MethodGet, http.MethodHead) {
+		return
+	}
+
 	interactMetrics := h.options.Stats
 	interactMetrics.Cache = GetCacheMetrics(h.options)
 	interactMetrics.Cpu = GetCpuMetrics()
