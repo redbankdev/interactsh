@@ -37,14 +37,14 @@ type HTTPServer struct {
 }
 
 const (
-	b64BodyPrefix        = "/b64_body:"
-	maxRequestBodyBytes  = 1 << 20
-	maxHeaderBytes       = 1 << 20
-	readTimeout          = 30 * time.Second
-	readHeaderTimeout    = 10 * time.Second
-	writeTimeout         = 30 * time.Second
-	idleTimeout          = 60 * time.Second
-	maxDynamicDelay      = 30 * time.Second
+	b64BodyPrefix       = "/b64_body:"
+	maxRequestBodyBytes = 1 << 20
+	maxHeaderBytes      = 1 << 20
+	readTimeout         = 30 * time.Second
+	readHeaderTimeout   = 10 * time.Second
+	writeTimeout        = 30 * time.Second
+	idleTimeout         = 60 * time.Second
+	maxDynamicDelay     = 30 * time.Second
 )
 
 type noopLogger struct {
@@ -340,6 +340,7 @@ func (h *HTTPServer) defaultHandler(w http.ResponseWriter, req *http.Request) {
 		if h.options.DynamicResp && len(req.URL.Query()) > 0 {
 			values := req.URL.Query()
 			applyDynamicHeaders(w, values["header"])
+			ensureDynamicDefaults(w)
 			if delay, ok := parseDynamicDelay(values.Get("delay")); ok {
 				time.Sleep(delay)
 			}
@@ -390,6 +391,7 @@ func writeResponseFromDynamicRequest(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	applyDynamicHeaders(w, values["header"])
+	ensureDynamicDefaults(w)
 	if delay, ok := parseDynamicDelay(values.Get("delay")); ok {
 		time.Sleep(delay)
 	}
@@ -436,6 +438,15 @@ func applyDynamicHeaders(w http.ResponseWriter, headers []string) {
 			continue
 		}
 		w.Header().Add(name, value)
+	}
+}
+
+func ensureDynamicDefaults(w http.ResponseWriter) {
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	}
+	if w.Header().Get("X-Content-Type-Options") == "" {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 	}
 }
 
